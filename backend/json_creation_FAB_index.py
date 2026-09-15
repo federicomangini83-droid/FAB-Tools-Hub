@@ -35,6 +35,8 @@ import os
 import re
 import sys
 import traceback
+import unicodedata
+import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from statistics import median
@@ -87,6 +89,16 @@ WRITE_JSON = True
 WRITE_TXT = True
 WRITE_XLSX = True
 WRITE_LLM_TXT = True    # one flat, marker-annotated file per corpus
+
+# --- zip --------------------------------------------------------------------
+WRITE_ZIP = True
+# One JSON per source document instead of a single combined file. Useful when
+# the archive feeds a per-document ingestion pipeline.
+ZIP_PER_DOCUMENT_JSON = True
+# Also place the combined index next to the per-document files.
+ZIP_INCLUDE_COMBINED_JSON = True
+# Keep the per-document JSON files on disk after zipping them.
+ZIP_KEEP_LOOSE_JSON = False
 
 LOG_LEVEL = logging.INFO
 
@@ -1234,6 +1246,99 @@ def records_to_frame(records: list[Record]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def slugify_filename(name: str, *, fallback: str = "document") -> str:
+    """Turn a document name into a safe, ASCII-only file name stem."""
+    stem = os.path.splitext(os.path.basename(name))[0]
+    stem = unicodedata.normalize("NFKD", stem)
+    stem = stem.encode("ascii", "ignore").decode("ascii")
+    stem = _SLUG_RE.sub("_", stem).strip("._-")
+    return stem[:100] or fallback
+
+
+def group_by_document(records: list[Record]) -> dict[str, list[Record]]:
+    grouped: dict[str, list[Record]] = {}
+    for record in records:
+        grouped.setdefault(record.document, []).append(record)
+    return grouped
+
+
+def build_document_payload(document: str, records: list[Record]) -> dict:
+    """The JSON payload written for a single source document."""
+    return {
+        "document": document,
+        "source_type": records[0].source_type if records else "",
+        "n_blocks": len(records),
+        "n_pages": len({r.page for r in records if r.page is not None}),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "blocks": [asdict(r) for r in records],
+    }
+
+
+def write_zip(records: list[Record], folder: str, basename: str) -> str | None:
+    """
+    Bundle the JSON outputs into a flat archive.
+
+    Every entry is stored with `arcname` set to the bare file name, so the
+    archive has no internal directory: unzipping drops the JSON files straight
+    into the current folder.
+    """
+    if not records:
+        return None
+
+    zip_path = os.path.join(folder, f"{basename}.zip")
+    used_names: set[str] = set()
+    loose_paths: list[str] = []
+
+    def unique_name(stem: str) -> str:
+        candidate = f"{stem}.json"
+        counter = 2
+        while candidate.lower() in used_names:
+            candidate = f"{stem}_{counter}.json"
+            counter += 1
+        used_names.add(candidate.lower())
+        return candidate
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+
+        if ZIP_PER_DOCUMENT_JSON:
+            for document, document_records in group_by_document(records).items():
+                entry_name = unique_name(slugify_filename(document))
+                payload = build_document_payload(document, document_records)
+                content = json.dumps(payload, ensure_ascii=False, indent=2)
+
+                # writestr never creates a directory entry.
+                archive.writestr(entry_name, content)
+
+                if ZIP_KEEP_LOOSE_JSON:
+                    loose_path = os.path.join(folder, entry_name)
+                    with open(loose_path, "w", encoding="utf-8") as handle:
+                        handle.write(content)
+                    loose_paths.append(loose_path)
+
+        if ZIP_INCLUDE_COMBINED_JSON or not ZIP_PER_DOCUMENT_JSON:
+            entry_name = unique_name(slugify_filename(basename, fallback="index"))
+            archive.writestr(
+                entry_name,
+                json.dumps([asdict(r) for r in records], ensure_ascii=False, indent=2),
+            )
+
+    # Fail loudly if a nested path ever slips into the archive.
+    with zipfile.ZipFile(zip_path) as archive:
+        nested = [n for n in archive.namelist() if "/" in n or "\\" in n]
+        if nested:
+            log.error("Nested entries found in the archive: %s", nested)
+        else:
+            log.info("Archive is flat: %s entr(y/ies)", len(archive.namelist()))
+
+    for path in loose_paths:
+        log.debug("Loose JSON kept: %s", path)
+
+    return zip_path
+
+
 def write_outputs(records: list[Record], folder: str, basename: str) -> list[str]:
     os.makedirs(folder, exist_ok=True)
     written: list[str] = []
@@ -1286,6 +1391,14 @@ def write_outputs(records: list[Record], folder: str, basename: str) -> list[str
             written.append(path)
         except Exception as exc:
             log.warning("XLSX not written: %s", exc)
+
+    if WRITE_ZIP:
+        try:
+            zip_path = write_zip(records, folder, basename)
+            if zip_path:
+                written.append(zip_path)
+        except Exception as exc:
+            log.warning("ZIP not written: %s", exc)
 
     return written
 
